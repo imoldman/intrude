@@ -1,0 +1,98 @@
+#!/usr/bin/env python
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import StringIO
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+ARCH_PREFIX = 'architecture '
+COUNT_PREFIX = 'nfat_arch '
+
+def is_fat(file_path):
+  command = ['lipo', '-info', file_path]
+  print command
+  output = subprocess.check_output(command)
+  return output.find('Non-fat') == -1
+
+def get_all_architecture_for_fat_file(file_path):
+  command = ['lipo', '-detailed_info', file_path]
+  print command
+  output = subprocess.check_output(command)
+  result = []
+  count = 0
+  for line in output.split('\n'):
+    if line.startswith(ARCH_PREFIX):
+      result.append(line[len(ARCH_PREFIX):])
+    elif line.startswith(COUNT_PREFIX):
+      count = int(line[len(COUNT_PREFIX):])
+  assert(count == len(result))
+  return result
+
+def insert_dylib_to_macho_and_get_fresh_dylib_name(file_path, dry_run):
+  command = [os.path.join(THIS_DIR, 'insert_dylib_to_macho'), '--file', file_path]
+  print command
+  if dry_run:
+    return "a.dylib"
+  else:
+    output = subprocess.check_output(command)
+    result = json.load(StringIO.StringIO(output))
+    assert(result["error"] == 0)
+    return result["filename"]
+
+def insert_dylib_to_universal_and_get_fresh_dylib_names(file_path, temp_dir, dry_run):
+  result = set()
+
+  archs = get_all_architecture_for_fat_file(file_path)
+  thin_file_paths = [os.path.join(temp_dir, arch) for arch in archs]
+  
+  # extract
+  for arch, thin_file_path in zip(archs, thin_file_paths):
+    command = ['lipo', file_path, '-thin', arch, '-output', thin_file_path]
+    print command
+    if not dry_run:
+      subprocess.check_call(command)
+
+  # insert
+  for thin_file_path in thin_file_paths:
+    dylib_name = insert_dylib_to_macho_and_get_fresh_dylib_name(thin_file_path, dry_run)
+    result.add(dylib_name)
+
+  # pack again
+  command = ['lipo']
+  command.extend(thin_file_paths)
+  command.extend(['-create', '-output', file_path])
+  print command
+  if not dry_run:
+    subprocess.check_call(command)
+
+  return list(result)
+
+def main():
+  description = ''' insert a dylib command to a binary file, the file must be macho or fat.
+
+  {self_name} --file /path/to/some/binary'''.format(self_name=sys.argv[0])
+  
+
+  parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter,)
+  parser.add_argument('--file', action='store', dest='file_path', required=True, help='full path for the binary file')
+  parser.add_argument('--dry_run', action='store_true', help='dry run, only show the action command line')
+  args = parser.parse_args()
+
+  names = []
+  if not is_fat(args.file_path):
+    names.append(insert_dylib_to_macho_and_get_fresh_dylib_name(args.file_path, args.dry_run))
+  else:
+    temp_dir = os.path.join(THIS_DIR, 'temp')
+    if not os.path.exists(temp_dir):
+      os.makedirs(temp_dir)
+    names = insert_dylib_to_universal_and_get_fresh_dylib_names(args.file_path, temp_dir, args.dry_run)
+
+  print json.dumps({"error":0, "filenames":names})
+
+if __name__ == '__main__':
+  main()
+
+# vim: number list tabstop=2 shiftwidth=2 expandtab
