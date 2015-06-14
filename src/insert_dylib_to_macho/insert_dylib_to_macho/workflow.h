@@ -8,45 +8,32 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 #include <set>
 #include <tuple>
 #include "loader.h"
 #include "util.h"
+#include "exception.h"
 
-static const std::string kExecutablePathPrefix = "@executale_path";
+static const std::string kExecutablePathWithSlashPrefix = "@executale_path/";
 static const std::string kDylibExtensionWithDot = ".dylib";
 
 template <typename MachoBriefInfo>
-class Runner {
+class Workflow {
 public:
-    Runner(const std::string& macho_path) : macho_path_(macho_path) { main(); }
+    Workflow(const std::string& macho_path) : macho_path_(macho_path) {}
     
-    ~Runner() {};
+    ~Workflow() {};
     
-private:
-    typedef typename MachoBriefInfo::MachHeader MachHeader;
-    typedef typename MachoBriefInfo::SegmentCommand SegmentCommand;
-    typedef typename MachoBriefInfo::DylibCommand DylibCommand;
-    typedef typename MachoBriefInfo::LoadCommand LoadCommand;
-    typedef typename MachoBriefInfo::SectionHeader SectionHeader;
-    static const uint32_t kAlignBase = MachoBriefInfo::kAlignBase;
-    
-    struct DylibCommandToWrite : public DylibCommand
-    {
-    public:
-        std::string path;
-    };
-    
-#pragma mark - actions
-    void main() {
+    void run() {
         file_ = fopen(macho_path_.c_str(), "rb+");
         if (file_ != NULL) {
             // 读取所需的Macho结构
             MachoBriefInfo info = do_read_macho_brief_info();
             // 计算要插入的dylib名字
-            std::string dylib_name = calc_fresh_dylib_name_by_macho_info(info);
+            dylib_name_ = calc_fresh_dylib_name_by_macho_info(info);
             // 根据dylib名字构建要插入的command
-            DylibCommandToWrite dylib_command = make_dylib_command_by_name(dylib_name);
+            DylibCommandToWrite dylib_command = make_dylib_command_by_name(dylib_name_);
             // 将command写入文件
             insert_command_to_dest_file(dylib_command, info);
             // 修改MachHeder
@@ -57,16 +44,36 @@ private:
             fclose(file_);
             return;
         }
-        assert(false);
+        throw Exception(ExceptionCode::kShouldNotOccur, util::build_string([&](std::ostringstream& ss) {
+            ss << "open file failed, file: " << macho_path_ << ", errno: " << errno;
+        }));
+    }
+    
+    std::string fresh_dylib_name() const {
+        return dylib_name_;
     }
 
+private:
+#pragma mark - types
+    typedef typename MachoBriefInfo::MachHeader MachHeader;
+    typedef typename MachoBriefInfo::SegmentCommand SegmentCommand;
+    typedef typename MachoBriefInfo::DylibCommand DylibCommand;
+    typedef typename MachoBriefInfo::LoadCommand LoadCommand;
+    typedef typename MachoBriefInfo::SectionHeader SectionHeader;
+    static const uint32_t kAlignBase = MachoBriefInfo::kAlignBase;
     
+    struct DylibCommandToWrite : public DylibCommand {
+        std::string path;
+    };
+  
+
+#pragma mark - actions
     MachoBriefInfo do_read_macho_brief_info() {
         MachoBriefInfo info;
         
         // read mach header
         info.mach_header = read_record<MachHeader>(0);
-        uint64_t offset = sizeof(MachHeader);
+        uint32_t offset = sizeof(MachHeader);
         
         // read commands and sections
         for (uint32_t index = 0; index < info.mach_header.value.ncmds; ++index) {
@@ -74,7 +81,7 @@ private:
             info.commands.push_back(command);
             if (command.value.cmd == LC_SEGMENT || command.value.cmd == LC_SEGMENT_64) {
                 auto segment_command = read_record<SegmentCommand>(offset);
-                uint64_t section_header_offset = offset + sizeof(SegmentCommand);
+                uint32_t section_header_offset = offset + sizeof(SegmentCommand);
                 for (uint32_t section_index = 0; section_index < segment_command.value.nsects; ++section_index) {
                     auto section_header = read_record<SectionHeader>(section_header_offset);
                     info.section_headers.push_back(section_header);
@@ -95,8 +102,8 @@ private:
                 auto dylib_command = read_record<DylibCommand>(command.offset);
                 auto name_offset = dylib_command.value.dylib.name.offset;
                 std::string name = read_cstring(command.offset + name_offset, dylib_command.value.cmdsize - name_offset);
-                if (util::string_start_with(name, kExecutablePathPrefix)) {
-                    names.insert(name.substr(kExecutablePathPrefix.length()));
+                if (util::string_start_with(name, kExecutablePathWithSlashPrefix)) {
+                    names.insert(name.substr(kExecutablePathWithSlashPrefix.length()));
                 }
             }
         }
@@ -104,8 +111,8 @@ private:
         for (uint32_t try_index = 0; try_index < try_max_count; ++try_index) {
             std::string name;
             const uint32_t kScale = 26;
-            for (; try_index != 0; try_index /= kScale) {
-                name.push_back('a' + (try_index % kScale));
+            for (uint32_t index = try_index; index != 0; index /= kScale) {
+                name.push_back('a' + (index % kScale));
             }
             if (name.size() == 0) {
                 name.push_back('a');
@@ -115,7 +122,7 @@ private:
                 return name;    // no conflict
             }
         }
-        assert(false);
+        throw Exception(ExceptionCode::kShouldNotOccur, "can not find a suitable name for the dylib");
         return std::string();
     }
     
@@ -127,7 +134,7 @@ private:
         result.dylib.compatibility_version = 0;
         
         // path and length
-        result.path = kExecutablePathPrefix + "/" + dylib_name;
+        result.path = kExecutablePathWithSlashPrefix + dylib_name;
         
         // align to 32bit or 64bit
         uint32_t length = ((uint32_t)result.path.length() + kAlignBase - 1) / kAlignBase * kAlignBase;
@@ -145,7 +152,6 @@ private:
     }
     
     void insert_command_to_dest_file(const DylibCommandToWrite& new_command, const MachoBriefInfo& src_macho_info) {
-        
         // find position to insert
         // find last command end position
         uint32_t insert_position = 0;
@@ -170,68 +176,42 @@ private:
         
         // check the space for new command
         if (section_1_postion - last_command_end_position < new_command.cmdsize) {
-            // TODO:exception
-            assert(false);
+            throw Exception(ExceptionCode::kNotImplement, "now we counldn't move the sections");
         }
         
         // write
         std::vector<uint8_t> buffer(section_1_postion - insert_position);
-        read(insert_position, section_1_postion - insert_position - new_command.cmdsize, &buffer[0] + new_command.cmdsize);
+        util::read(file_, insert_position, section_1_postion - insert_position - new_command.cmdsize, &buffer[0] + new_command.cmdsize);
         std::memcpy(&buffer[0], &new_command, sizeof(DylibCommand));
         std::memcpy(&buffer[0] + sizeof(DylibCommand), &new_command.path[0], new_command.path.length());
-        write(insert_position, (uint32_t)buffer.size(), &buffer[0]);
+        util::write(file_, insert_position, (uint32_t)buffer.size(), &buffer[0]);
     }
     
     void write_mach_header_to_dest_file(const MachHeader& mach_header) {
-        write(0, sizeof(MachHeader), (void*)&mach_header);
+        util::write(file_, 0, sizeof(MachHeader), (void*)&mach_header);
     }
     
-#pragma mark - util
-    void read(uint64_t from, uint64_t size, void* buffer) {
-        int err = fseek(file_, from, SEEK_SET);
-        if (err == 0) {
-            size_t readed_size = fread(buffer, sizeof(char), size, file_);
-            if (size == readed_size) {
-                return;
-            }
-        }
-        // TODO: exception
-        assert(false);
-    }
-    
-    template <typename T> T read(int64_t from) {
+#pragma mark - util    
+    template <typename T> T read(uint32_t from) {
         T result;
-        read(from, sizeof(T), &result);
+        util::read(file_, from, sizeof(T), &result);
         return result;
     }
     
-    template <typename T> Record<T> read_record(int64_t from) {
+    template <typename T> Record<T> read_record(uint32_t from) {
         T result = read<T>(from);
-        return Record<T>((uint32_t)from, std::move(result));
+        return Record<T>(from, std::move(result));
     }
     
-    std::string read_cstring(int64_t from, int64_t max_size) {
+    std::string read_cstring(uint32_t from, uint32_t max_size) {
         std::string buffer(max_size, 0);
-        read(from, max_size, &buffer[0]);
+        util::read(file_, from, max_size, &buffer[0]);
         return std::string(&buffer[0]);
     }
     
-    void write(uint32_t from, uint32_t size, void* buffer) {
-        int err = fseek(file_, from, SEEK_SET);
-        if (err == 0) {
-            size_t wroted_size = fwrite(buffer, sizeof(char), size, file_);
-            if (size == wroted_size) {
-                return;
-            }
-        }
-        // TODO: exception
-        assert(false);
-    }
-    
-    const std::string macho_path_;
-    
+    std::string dylib_name_;
+    std::string macho_path_;
     FILE* file_;
-
 };
 
 #endif /* defined(__insert_dylib_to_macho__runner__) */

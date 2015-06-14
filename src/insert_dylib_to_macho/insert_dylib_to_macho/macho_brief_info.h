@@ -8,14 +8,14 @@
 #include "record.h"
 #include "loader.h"
 
-class MachHeader : public mach_header {};
-class MachHeader64 : public mach_header_64 {};
-class SegmentCommand : public segment_command {};
-class SegmentCommand64 : public segment_command_64 {};
-class SectionHeader : public section {};
-class SectionHeader64 : public section_64 {};
-class DylibCommand : public dylib_command {};
-class LoadCommand : public load_command {};
+struct MachHeader : public mach_header {};
+struct MachHeader64 : public mach_header_64 {};
+struct SegmentCommand : public segment_command {};
+struct SegmentCommand64 : public segment_command_64 {};
+struct SectionHeader : public section {};
+struct SectionHeader64 : public section_64 {};
+struct DylibCommand : public dylib_command {};
+struct LoadCommand : public load_command {};
 
 class MachoBriefInfo32
 {
