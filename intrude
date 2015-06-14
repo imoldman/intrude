@@ -1,41 +1,184 @@
 #!/usr/bin/env python
 
+import argparse
+import json
 import os.path
 import subprocess
 import sys
-import argparse
-import datetime
+import StringIO
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_IPA_PATH_PARAM = 'src_ipa_path_param'
+DEST_IPA_PATH_PARAM = 'dest_ipa_path_param'
+NEW_BUNDLE_ID_PARAM = 'new_bundle_id'
+DYLIB_FILE_PARAM = 'dylib_file'
+CODESIGN_NAME_PARAM = 'codesign_name'
+EMBEDDED_PATH_PARAM = 'embedded_path'
 
-def color_print(str):
-  color_begin = '\033[33m'
-  color_end = '\033[0m'
-  print color_begin + str + color_end
+UNZIPPED_DIR = 'unzipped_dir'
+APP_PACKAGE_DIR = 'app_pacakge_dir'
+EXECUTABLE_FILE = 'executable_file'
+DYLIB_NEW_NAME = 'dylib_new_name'
 
-def run(config):
-  for index, name_and_command in enumerate(config):
-    index += 1
-    name = name_and_command['name']
-    command = name_and_command['command']
-    color_print('ACTION %d: %s' %(index, name))
-    color_print('=' * 50)
-    return_code = subprocess.call(command)
-    if return_code != 0:
-      color_print('ACTION %d FAILED: %s' % (index, name))
+def make_sure_dir_exist(dir_path):
+  if not os.path.exists(dir_path):
+    os.makedirs(dir_path)
+
+def do_unzip_src_ipa(context):
+  unzipped_dir = context[UNZIPPED_DIR]
+  make_sure_dir_exist(unzipped_dir)
+  command = ['/usr/bin/unzip', '-q', context[SRC_IPA_PATH_PARAM], '-d', unzipped_dir]
+  print ' '.join(command)
+  subprocess.check_call(command)
+
+def do_fill_app_package_dir_to_context(context):
+  path = os.path.join(context[UNZIPPED_DIR], 'Payload')
+  output = subprocess.check_output(['ls', '-1'], cwd=path).strip()
+  for line in output.split('\n'):
+    if line.endswith('.app'):
+      context[APP_PACKAGE_DIR] = os.path.join(path, line)
       return
+  assert(False)
+
+def do_fill_package_executable_path_to_context(context):
+  plist_path = os.path.join(context[APP_PACKAGE_DIR], 'Info.plist')
+  command = ['/usr/libexec/PlistBuddy', '-c', 'Print :CFBundleExecutable', plist_path]
+  print ' '.join(command)
+  context[EXECUTABLE_FILE] = subprocess.check_output(command).strip()
+
+def do_remove_plugins_dir(context):
+  src_path = os.path.join(context[APP_PACKAGE_DIR], 'Plugins')
+  dest_path = os.path.join(context[APP_PACKAGE_DIR], 'Plugins.save')
+  if os.path.exists(src_path):
+    command = ['mv', '-f', src_path, dest_path]
+    print ' '.join(command)
+    subprocess.check_call(command)
+
+def do_change_bundle_id_in_app(context):
+  plist_path = os.path.join(context[APP_PACKAGE_DIR], 'Info.plist')
+  param = 'Set :CFBundleIdentifier %s' % context[NEW_BUNDLE_ID_PARAM]
+  command = ['/usr/libexec/PlistBuddy', '-c', param, plist_path]
+  print ' '.join(command)
+  subprocess.check_call(command)
+
+def do_change_bundle_id_in_metadata_plist(context):
+  param = 'Set :softwareVersionBundleId %s' % context[NEW_BUNDLE_ID_PARAM]
+  plist_file = os.path.join(context[UNZIPPED_DIR], 'iTunesMetadata.plist')
+  if os.path.exists(plist_file):
+    command = ['/usr/libexec/PlistBuddy', '-c', param, plist_file]
+    print ' '.join(command)
+    subprocess.check_call(command)
+
+def do_insert_load_dylib_command_to_excutable_file(context):
+  exe_file = os.path.join(context[APP_PACKAGE_DIR], context[EXECUTABLE_FILE])
+  command = [os.path.join(THIS_DIR, 'toolchain', 'insert_dylib_to_binary'), '--file', exe_file]
+  print ' '.join(command)
+  filename = subprocess.check_output(command).strip()
+  context[DYLIB_NEW_NAME] = filename
+
+def codesign(binary_file, sign_name):
+  command = ['/usr/bin/codesign', '-f', '-s', sign_name, binary_file]
+  print ' '.join(command)
+  subprocess.check_call(command)
+
+def do_codesign_executable_file(context):
+  codesign(os.path.join(context[APP_PACKAGE_DIR], context[EXECUTABLE_FILE]), context[CODESIGN_NAME_PARAM])
+
+def do_replace_provision(context):
+  embedded_provision = os.path.join(context[APP_PACKAGE_DIR], 'embedded.mobileprovision')
+  if os.path.exists(embedded_provision):
+    os.remove(embedded_provision)
+  command = ['cp', context[EMBEDDED_PATH_PARAM], embedded_provision]
+  print ' '.join(command)
+  subprocess.check_call(command)
+
+def do_copy_dylib_into_app(context):
+  dylib_new_file = os.path.join(context[APP_PACKAGE_DIR], context[DYLIB_NEW_NAME])
+  command = ['cp', '-f', context[DYLIB_FILE_PARAM], dylib_new_file]
+  print ' '.join(command)
+  subprocess.check_call(command)
+  codesign(dylib_new_file, context[CODESIGN_NAME_PARAM])
+
+def do_zip_to_dest_ipa(context):
+  dest_ipa_path = os.path.realpath(context[DEST_IPA_PATH_PARAM])
+  command = ['/usr/bin/zip', '-y', '-r', dest_ipa_path, '.']
+  print ' '.join(command)
+  subprocess.check_call(command, cwd=context[UNZIPPED_DIR])
+
+def build_config():
+  config = [{
+    'name' : 'unzip ipa',
+    'method' : do_unzip_src_ipa
+  }, {
+    'name' : 'get package dir',
+    'method' : do_fill_app_package_dir_to_context
+  }, {
+    'name' : 'get executable file\'s name',
+    'method' : do_fill_package_executable_path_to_context
+  }, {
+    'name' : 'remove plugins dir',
+    'method' : do_remove_plugins_dir
+  }, {
+    'name' : 'change bundle id, part 1',
+    'method' : do_change_bundle_id_in_app
+  }, {
+    'name' : 'change bundle id, part 2',
+    'method' : do_change_bundle_id_in_metadata_plist
+  }, {
+    'name' : 'modify executable file',
+    'method' : do_insert_load_dylib_command_to_excutable_file
+  }, {
+    'name' : 'resign executable file',
+    'method' : do_codesign_executable_file
+  }, {
+    'name' : 'replace embedded provision',
+    'method' : do_replace_provision
+  }, {
+    'name' : 'copy dylib to app package',
+    'method' : do_copy_dylib_into_app
+  }, {
+    'name' : 'zip to ipa',
+    'method' : do_zip_to_dest_ipa
+  }];
+
+  return config
+
+def init_context_with_args(args):
+  return {
+    SRC_IPA_PATH_PARAM : args.ipa,
+    DEST_IPA_PATH_PARAM : args.ipa + '.modified.ipa',
+    NEW_BUNDLE_ID_PARAM : args.bundle_id,
+    DYLIB_FILE_PARAM : args.dylib,
+    CODESIGN_NAME_PARAM : args.sign_id,
+    EMBEDDED_PATH_PARAM : args.provision,
+
+    UNZIPPED_DIR : os.path.join(THIS_DIR, 'temp')
+  }
+
+def run(context, config):
+  for index, command  in enumerate(config):
+    index += 1
+    print '=' * 50
+    print 'ACTION %d: %s' %(index, command['name'])
+    method = command.get('method')
+    method(context)
 
 def main():
   description = ''' intrude a dylib libary to a ipa package.
 
   {self_name} --ipa /path/to/some.ipa --dylib /path/to/executable/some.dylib'''.format(self_name=sys.argv[0])
-  
 
   parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter,)
   parser.add_argument('--ipa', action='store', dest='ipa', required=True, help='full path for ipa file')
   parser.add_argument('--dylib', action='store', dest='dylib', required=True, help='full path for dylib library')
-  parser.add_argument('--dry_run', action='store_true', help='dry run, only show the action command line')
+  parser.add_argument('--bundle', action='store', dest='bundle_id', required=True, help='new bundle id for ipa file')
+  parser.add_argument('--sign', action='store', dest='sign_id', required=True, help='identify for code sign')
+  parser.add_argument('--provision', action='store', dest='provision', required=True, help='embedded provision for new ipa')
   args = parser.parse_args()
+
+  context = init_context_with_args(args)
+  config = build_config()
+  run(context, config)
 
 if __name__ == '__main__':
   main()
