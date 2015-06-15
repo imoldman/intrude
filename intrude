@@ -3,6 +3,7 @@
 import argparse
 import json
 import os.path
+import plistlib
 import subprocess
 import sys
 import StringIO
@@ -18,6 +19,7 @@ EMBEDDED_PATH_PARAM = 'embedded_path'
 UNZIPPED_DIR = 'unzipped_dir'
 APP_PACKAGE_DIR = 'app_pacakge_dir'
 EXECUTABLE_FILE = 'executable_file'
+ENTITLEMENTS_PATH = 'entitlements_path'
 DYLIB_NEW_NAME = 'dylib_new_name'
 
 def make_sure_dir_exist(dir_path):
@@ -76,14 +78,6 @@ def do_insert_load_dylib_command_to_excutable_file(context):
   filename = subprocess.check_output(command).strip()
   context[DYLIB_NEW_NAME] = filename
 
-def codesign(binary_file, sign_name):
-  command = ['/usr/bin/codesign', '-f', '-s', sign_name, binary_file]
-  print ' '.join(command)
-  subprocess.check_call(command)
-
-def do_codesign_executable_file(context):
-  codesign(os.path.join(context[APP_PACKAGE_DIR], context[EXECUTABLE_FILE]), context[CODESIGN_NAME_PARAM])
-
 def do_replace_provision(context):
   embedded_provision = os.path.join(context[APP_PACKAGE_DIR], 'embedded.mobileprovision')
   if os.path.exists(embedded_provision):
@@ -92,12 +86,28 @@ def do_replace_provision(context):
   print ' '.join(command)
   subprocess.check_call(command)
 
+def do_replace_entitlements(context):
+  command = ['/usr/bin/security', 'cms', '-D', '-i', context[EMBEDDED_PATH_PARAM]]
+  print' '.join(command)
+  output = subprocess.check_output(command, cwd=context[UNZIPPED_DIR]).strip()
+  entitlements_file = os.path.join(context[UNZIPPED_DIR], 'entitlements.plist')
+  plistlib.writePlist(plistlib.readPlist(StringIO.StringIO(output))['Entitlements'], entitlements_file)
+  context[ENTITLEMENTS_PATH] = entitlements_file
+
 def do_copy_dylib_into_app(context):
   dylib_new_file = os.path.join(context[APP_PACKAGE_DIR], context[DYLIB_NEW_NAME])
   command = ['cp', '-f', context[DYLIB_FILE_PARAM], dylib_new_file]
   print ' '.join(command)
   subprocess.check_call(command)
-  codesign(dylib_new_file, context[CODESIGN_NAME_PARAM])
+  command = ['/usr/bin/codesign', '-f', '-s', context[CODESIGN_NAME_PARAM], dylib_new_file]
+  print ' '.join(command)
+  subprocess.check_call(command)
+
+def do_codesign_app_package(context):
+  entitlements_param = '--entitlements=%s' % context[ENTITLEMENTS_PATH]
+  command = ['/usr/bin/codesign', '-f', '-s', context[CODESIGN_NAME_PARAM], '--no-strict', entitlements_param, context[APP_PACKAGE_DIR]]
+  print ' '.join(command)
+  subprocess.check_call(command)
 
 def do_zip_to_dest_ipa(context):
   dest_ipa_path = os.path.realpath(context[DEST_IPA_PATH_PARAM])
@@ -128,14 +138,17 @@ def build_config():
     'name' : 'modify executable file',
     'method' : do_insert_load_dylib_command_to_excutable_file
   }, {
-    'name' : 'resign executable file',
-    'method' : do_codesign_executable_file
-  }, {
     'name' : 'replace embedded provision',
     'method' : do_replace_provision
   }, {
+    'name' : 'replace entitlements file',
+    'method' : do_replace_entitlements
+  }, {
     'name' : 'copy dylib to app package',
     'method' : do_copy_dylib_into_app
+  }, {
+    'name' : 'resign app package',
+    'method' : do_codesign_app_package
   }, {
     'name' : 'zip to ipa',
     'method' : do_zip_to_dest_ipa

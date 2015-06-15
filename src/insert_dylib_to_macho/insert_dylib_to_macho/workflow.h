@@ -15,7 +15,7 @@
 #include "util.h"
 #include "exception.h"
 
-static const std::string kExecutablePathWithSlashPrefix = "@executale_path/";
+static const std::string kExecutablePathWithSlashPrefix = "@executable_path/";
 static const std::string kDylibExtensionWithDot = ".dylib";
 
 template <typename MachoBriefInfo>
@@ -135,6 +135,7 @@ private:
         
         // path and length
         result.path = kExecutablePathWithSlashPrefix + dylib_name;
+        result.path.push_back('\0');
         
         // align to 32bit or 64bit
         uint32_t length = ((uint32_t)result.path.length() + kAlignBase - 1) / kAlignBase * kAlignBase;
